@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+- **Toolchain installer** (Diagnostics → Cross-Compile Toolchains, `godot-build toolchain`):
+  - llvm-mingw for Windows, downloaded from its latest release, followed by Godot's Windows dependencies.
+  - osxcross for macOS, built from an Xcode `.xip` or a packaged `MacOSX*.sdk.tar.xz`.
+  - MoltenVK, so macOS templates can use Vulkan.
+- **Vulkan on macOS** setting: MoltenVK is linked into macOS templates automatically once installed.
+- Export Templates shows **Set Up Toolchains…** when Windows or macOS is unavailable.
+- Diagnostics explain how to install a missing toolchain instead of only asking for an environment variable.
+- The osxcross installer names any missing build tools, with the install command for your distribution.
+
 ## 1.1.0
 
 First public release.

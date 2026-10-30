@@ -56,6 +56,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,15 +104,16 @@ LOG_DIR = WORKSPACE / "logs"
 STATE_FILE = LOG_DIR / ".state.json"
 DIST_DIR = WORKSPACE / "dist"
 NUGET_LOCAL_DIR = WORKSPACE / "nuget"
+TOOLCHAIN_DIR = WORKSPACE / "toolchains"  # what `toolchain install` downloads and builds
 
 _mingw_clang = shutil.which("x86_64-w64-mingw32-clang")
 LLVM_MINGW_DIR = (_path_setting("MINGW_PREFIX", "llvm_mingw")
-                  or _first_dir("/opt/llvm-mingw", Path.home() / "llvm-mingw", WORKSPACE / "llvm-mingw")
+                  or _first_dir(TOOLCHAIN_DIR / "llvm-mingw", "/opt/llvm-mingw", Path.home() / "llvm-mingw")
                   or (Path(_mingw_clang).resolve().parent.parent if _mingw_clang else Path("/opt/llvm-mingw")))
 OSXCROSS_CANDIDATES = [
     os.environ.get("OSXCROSS_ROOT", ""),
     str(_stored_config().get("osxcross_root", "")),
-    str(WORKSPACE / "osxcross"),
+    str(TOOLCHAIN_DIR / "osxcross"),
     str(Path.home() / "osxcross"),
 ]
 
@@ -349,8 +351,10 @@ class Job:
             f"module_mono_enabled={'yes' if self.mono else 'no'}",
             "progress=no",
         ]
-        if self.platform.key == "macos" and ctx.osxcross_sdk:
-            args.append(f"osxcross_sdk={ctx.osxcross_sdk}")
+        if self.platform.key == "macos":
+            if ctx.osxcross_sdk:
+                args.append(f"osxcross_sdk={ctx.osxcross_sdk}")
+            args += macos_vulkan_args(ctx.source)
         if ctx.jobs:
             args.append(f"-j{ctx.jobs}")
         return args + list(ctx.extra_scons_args)
@@ -470,10 +474,10 @@ class Context:
             return (bool(shutil.which("clang") or shutil.which("gcc")), "no C++ compiler (clang or gcc) found")
         if platform.key == "windows":
             clang = LLVM_MINGW_DIR / "bin" / "x86_64-w64-mingw32-clang"
-            return (clang.exists(), f"llvm-mingw not found at {LLVM_MINGW_DIR}")
+            return (clang.exists(), "llvm-mingw not installed (Diagnostics → Toolchains, or: godot-build toolchain install mingw)")
         if platform.key == "macos":
             if not self.osxcross_root:
-                return (False, "osxcross not found (set OSXCROSS_ROOT)")
+                return (False, "osxcross not installed (Diagnostics → Toolchains, or: godot-build toolchain install osxcross)")
             if not lipo_tool(self):
                 return (False, "no lipo tool (osxcross lipo or llvm-lipo)")
             return (True, "")
@@ -1051,9 +1055,12 @@ def cmd_doctor(ctx: Context, args: argparse.Namespace | None = None) -> int:
         present = all(p.exists() for p in paths)
         check(name, present, str(paths[0].relative_to(ctx.source)), "missing (run: godot_build.py deps)",
               required=False)
-    mvk = custom_py_value(ctx.source, "_MOLTENVK_SDK")
-    check("MoltenVK (macOS)", bool(mvk), mvk,
-          "not set in custom.py: macOS builds use Metal/OpenGL only", required=False)
+    mvk = custom_py_value(ctx.source, "_MOLTENVK_SDK") or str(moltenvk_dir() or "")
+    vulkan_on = bool(custom_py_value(ctx.source, "_MOLTENVK_SDK")) or manager_settings().get("macos_vulkan", True)
+    check("MoltenVK (macOS)", bool(mvk) and vulkan_on, mvk,
+          ("not installed: macOS templates fall back to OpenGL on Intel Macs "
+           "(Diagnostics → Toolchains, or: godot-build toolchain install moltenvk)") if vulkan_on else
+          "Vulkan on macOS is turned off in Settings (macos_vulkan)", required=False)
 
     heading("Machine")
     free_gb = shutil.disk_usage(ctx.source).free / 1024**3
@@ -1901,6 +1908,11 @@ MANAGER_SPEC = [
      "Windows cross-compiler. Empty = auto-detect (/opt/llvm-mingw, ~/llvm-mingw, PATH)."),
     ("osxcross_root", "path", "", "osxcross folder",
      "macOS cross toolchain (the osxcross checkout). Empty = auto-detect."),
+    ("moltenvk_sdk", "path", "", "MoltenVK folder",
+     "The MoltenVK.xcframework used for Vulkan on macOS. Empty = the one `toolchain install moltenvk` downloads."),
+    ("macos_vulkan", "bool", True, "Vulkan on macOS (MoltenVK)",
+     "Link MoltenVK into macOS templates when it is installed, so Intel Macs get Vulkan instead of OpenGL. "
+     "Apple Silicon uses Metal either way."),
     ("manager_in_launcher", "bool", True, "Show Build Manager in the app launcher",
      "Off: it is only reachable by right-clicking Godot in the launcher. Applies on the next integrate."),
     ("auto_check", "bool", True, "Check for updates when Godot opens",
@@ -2677,6 +2689,304 @@ def cmd_storage(ctx: Context, args: argparse.Namespace) -> int:
 
 
 # ==============================================================================
+#  Cross-compile toolchains
+# ==============================================================================
+
+OSXCROSS_REPO = "https://github.com/tpoechtrager/osxcross.git"
+XCODE_DOWNLOADS = "https://developer.apple.com/download/all/?q=xcode"
+SDK_ARCHIVE_RE = re.compile(r"^MacOSX([\d.]*)\.sdk\.tar\.(xz|bz2|gz|zst)$")
+MVK_LIB = Path("macos-arm64_x86_64") / "libMoltenVK.a"
+OSXCROSS_TOOLS = ("git", "clang", "cmake", "make", "patch", "xz")
+OSXCROSS_PACKAGES = {
+    "pacman": "sudo pacman -S --needed clang cmake git patch python libxml2 openssl xz bzip2 zlib cpio make",
+    "apt-get": "sudo apt install clang cmake git patch python3 libssl-dev liblzma-dev libxml2-dev zlib1g-dev "
+               "libbz2-dev cpio make",
+    "dnf": "sudo dnf install clang cmake git patch python3 openssl-devel xz-devel libxml2-devel zlib-devel "
+           "bzip2-devel cpio make",
+    "zypper": "sudo zypper install clang cmake git patch python3 libopenssl-devel xz-devel libxml2-devel "
+              "zlib-devel libbz2-devel cpio make",
+}
+
+
+def osxcross_packages() -> str:
+    return next((cmd for tool, cmd in OSXCROSS_PACKAGES.items() if shutil.which(tool)), "")
+
+
+def moltenvk_dir() -> Path | None:
+    for candidate in (manager_settings().get("moltenvk_sdk"), TOOLCHAIN_DIR / "moltenvk"):
+        if candidate and (Path(str(candidate)).expanduser() / MVK_LIB).is_file():
+            return Path(str(candidate)).expanduser()
+    return None
+
+
+def macos_vulkan_args(source: Path) -> list[str]:
+    """SCons args that link MoltenVK into macOS builds (unless custom.py already chose)."""
+    if custom_py_value(source, "_MOLTENVK_SDK"):
+        return []
+    if not manager_settings().get("macos_vulkan", True):
+        return ["vulkan=no"]
+    mvk = moltenvk_dir()
+    return ["vulkan=yes", f"vulkan_sdk_path={mvk}"] if mvk else []
+
+
+def remember_toolchain(key: str, path: Path | None) -> None:
+    if key in {n for n, *_ in MANAGER_SPEC}:
+        write_manager(key, str(path) if path else "")
+
+
+def _version_file(path: Path) -> str:
+    with contextlib.suppress(OSError):
+        return (path / ".gbm-version").read_text().strip()
+    return ""
+
+
+def toolchain_status() -> dict:
+    osx_root, osx_sdk = find_osxcross()
+    mingw = (LLVM_MINGW_DIR / "bin" / "x86_64-w64-mingw32-clang").exists()
+    mvk = moltenvk_dir()
+    tarballs = TOOLCHAIN_DIR / "osxcross" / "tarballs"
+    return {
+        "dir": str(TOOLCHAIN_DIR),
+        "mingw": {"installed": mingw, "path": str(LLVM_MINGW_DIR) if mingw else None,
+                  "version": _version_file(LLVM_MINGW_DIR) if mingw else ""},
+        "osxcross": {"installed": bool(osx_root), "path": str(osx_root) if osx_root else None, "sdk": osx_sdk,
+                     "sdk_archives": sorted(p.name for p in tarballs.glob("MacOSX*.sdk.tar.*"))
+                     if tarballs.is_dir() else [],
+                     "missing_tools": [t for t in OSXCROSS_TOOLS if not shutil.which(t)],
+                     "packages": osxcross_packages()},
+        "moltenvk": {"installed": bool(mvk), "path": str(mvk) if mvk else None,
+                     "version": _version_file(mvk) if mvk else "",
+                     "enabled": bool(manager_settings().get("macos_vulkan", True))},
+    }
+
+
+def github_latest(repo: str) -> dict:
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "godot-build"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except (OSError, ValueError) as exc:
+        raise BuildError(f"Could not reach GitHub for {repo}: {exc}") from exc
+
+
+def download(url: str, dest: Path, title: str, size: int = 0) -> None:
+    """Download with progress events (the Activity page shows a percentage bar)."""
+    if dest.is_file() and size and dest.stat().st_size == size:
+        ok(f"{dest.name} already downloaded")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    task_id = f"download:{dest.name}"
+    emit("task_start", id=task_id, title=title, log=None, expected=100)
+    info(f"{title} {S.dim('… ' + url)}")
+    last = -1
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "godot-build"})
+        with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as out:
+            total = int(resp.headers.get("Content-Length") or size or 0)
+            done = 0
+            while chunk := resp.read(1 << 20):
+                out.write(chunk)
+                done += len(chunk)
+                pct = done * 100 // total if total else 0
+                if pct != last or not total:
+                    last = pct
+                    text = f"{fmt_size(done)} of {fmt_size(total)}  ({pct}%)" if total else fmt_size(done)
+                    emit("line", id=task_id, text=text, steps=pct, expected=100, error=False)
+                    if not JSON_MODE and sys.stdout.isatty():
+                        print(f"\r    {text}   ", end="", flush=True)
+    except (OSError, ValueError) as exc:
+        part.unlink(missing_ok=True)
+        emit("task_end", id=task_id, ok=False, code=1)
+        raise BuildError(f"Download failed: {exc}") from exc
+    if not JSON_MODE and sys.stdout.isatty():
+        print()
+    part.replace(dest)
+    emit("task_end", id=task_id, ok=True, code=0)
+
+
+def _plain_ctx() -> argparse.Namespace:
+    return argparse.Namespace(verbose=False, git_commit="")
+
+
+def extract(archive: Path, name: str) -> Path:
+    """Unpack into a scratch folder and return the archive's single top-level folder."""
+    staging = TOOLCHAIN_DIR / ".extract"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    if not run_logged(["tar", "-xf", str(archive), "-C", str(staging)], cwd=TOOLCHAIN_DIR, env=os.environ.copy(),
+                      log_path=new_log_path(f"extract_{name}"), title=f"Extracting {archive.name}",
+                      state_key=None, ctx=_plain_ctx(), task_id=f"extract:{name}"):
+        raise BuildError(f"Could not extract {archive.name}")
+    entries = list(staging.iterdir())
+    return entries[0] if len(entries) == 1 else staging
+
+
+def replace_dir(src: Path, dest: Path) -> None:
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    shutil.rmtree(TOOLCHAIN_DIR / ".extract", ignore_errors=True)
+
+
+def install_mingw() -> Path:
+    heading("llvm-mingw (Windows)")
+    release = github_latest("mstorsjo/llvm-mingw")
+    arch = {"x86_64": "x86_64", "arm64": "aarch64"}.get(HOST_ARCH, HOST_ARCH)
+    asset = next((a for a in release.get("assets", [])
+                  if re.fullmatch(rf"llvm-mingw-.+-ucrt-ubuntu-[\d.]+-{arch}\.tar\.xz", a["name"])), None)
+    if not asset:
+        raise BuildError(f"llvm-mingw {release.get('tag_name', '')} has no Linux {arch} build.")
+    archive = TOOLCHAIN_DIR / "downloads" / asset["name"]
+    download(asset["browser_download_url"], archive, f"Downloading llvm-mingw {release['tag_name']}", asset["size"])
+    dest = TOOLCHAIN_DIR / "llvm-mingw"
+    replace_dir(extract(archive, "llvm-mingw"), dest)
+    archive.unlink(missing_ok=True)
+    if not (dest / "bin" / "x86_64-w64-mingw32-clang").exists():
+        raise BuildError(f"{dest} does not contain x86_64-w64-mingw32-clang")
+    (dest / ".gbm-version").write_text(release["tag_name"] + "\n")
+    remember_toolchain("llvm_mingw", dest)
+    ok(f"llvm-mingw {release['tag_name']} installed in {dest}")
+    return dest
+
+
+def install_moltenvk() -> Path:
+    heading("MoltenVK (Vulkan on macOS)")
+    release = github_latest("KhronosGroup/MoltenVK")
+    asset = next((a for a in release.get("assets", []) if a["name"] == "MoltenVK-macos.tar"), None)
+    if not asset:
+        raise BuildError(f"MoltenVK {release.get('tag_name', '')} has no MoltenVK-macos.tar download.")
+    archive = TOOLCHAIN_DIR / "downloads" / asset["name"]
+    download(asset["browser_download_url"], archive, f"Downloading MoltenVK {release['tag_name']}", asset["size"])
+    top = extract(archive, "moltenvk")
+    framework = top / "MoltenVK" / "static" / "MoltenVK.xcframework"
+    if not (framework / MVK_LIB).is_file():
+        raise BuildError("Unexpected MoltenVK archive layout (no static MoltenVK.xcframework).")
+    dest = TOOLCHAIN_DIR / "moltenvk"
+    replace_dir(framework, dest)
+    archive.unlink(missing_ok=True)
+    (dest / ".gbm-version").write_text(release["tag_name"] + "\n")
+    ok(f"MoltenVK {release['tag_name']} installed in {dest}")
+    if not manager_settings().get("macos_vulkan", True):
+        warn("Vulkan on macOS is turned off in settings (macos_vulkan), so MoltenVK is not used yet.")
+    return dest
+
+
+def _sdk_version(name: str) -> tuple[int, ...]:
+    match = SDK_ARCHIVE_RE.match(name)
+    return tuple(int(p) for p in match.group(1).split(".") if p) if match else ()
+
+
+def install_osxcross(sdk: str | None) -> Path:
+    heading("osxcross (macOS)")
+    root = TOOLCHAIN_DIR / "osxcross"
+    tarballs = root / "tarballs"
+    sdk_path = Path(sdk).expanduser().resolve() if sdk else None
+    if sdk_path and not sdk_path.is_file():
+        raise BuildError(f"{sdk_path} does not exist.")
+    if sdk_path and sdk_path.suffix != ".xip" and not SDK_ARCHIVE_RE.match(sdk_path.name):
+        raise BuildError("Expected an Xcode .xip or a MacOSX<version>.sdk.tar.xz archive.")
+    if not sdk_path and not list(tarballs.glob("MacOSX*.sdk.tar.*")):
+        raise BuildError("osxcross needs Apple's macOS SDK, which only ships inside Xcode. Download Xcode (.xip, "
+                         f"free Apple account) from {XCODE_DOWNLOADS} and pass it with --sdk, or pass a "
+                         "MacOSX<version>.sdk.tar.xz packaged on a Mac with osxcross's gen_sdk_package.sh.")
+    missing = [t for t in OSXCROSS_TOOLS if not shutil.which(t)]
+    if sdk_path and sdk_path.suffix == ".xip" and not shutil.which("cpio"):
+        missing.append("cpio")
+    if missing:
+        hint = osxcross_packages()
+        raise BuildError(f"Building osxcross needs: {', '.join(missing)}." + (f" Install with: {hint}" if hint else ""))
+
+    env = os.environ.copy()
+    if not (root / "build.sh").is_file():
+        shutil.rmtree(root, ignore_errors=True)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        if not run_logged(["git", "clone", "--depth", "1", "--progress", OSXCROSS_REPO, str(root)],
+                          cwd=root.parent, env=env, log_path=new_log_path("osxcross_clone"),
+                          title="Cloning osxcross", state_key=None, ctx=_plain_ctx(), task_id="osxcross:clone"):
+            raise BuildError("Could not clone osxcross.")
+    tarballs.mkdir(parents=True, exist_ok=True)
+    if sdk_path and sdk_path.suffix == ".xip":
+        if not run_logged(["./tools/gen_sdk_package_pbzx.sh", str(sdk_path)], cwd=root, env=env,
+                          log_path=new_log_path("osxcross_sdk"), title="Extracting the macOS SDK from Xcode",
+                          state_key=None, ctx=_plain_ctx(), task_id="osxcross:sdk"):
+            raise BuildError("Could not extract the SDK from Xcode (see the log).")
+        packaged = list(root.glob("MacOSX*.sdk.tar.*"))
+        if not packaged:
+            raise BuildError("Xcode was unpacked but no MacOSX SDK archive was produced.")
+        for archive in packaged:
+            shutil.move(str(archive), str(tarballs / archive.name))
+    elif sdk_path:
+        shutil.copy2(sdk_path, tarballs / sdk_path.name)
+
+    newest = max((p.name for p in tarballs.glob("MacOSX*.sdk.tar.*")), key=_sdk_version)
+    version = ".".join(map(str, _sdk_version(newest)))
+    if version:
+        env["SDK_VERSION"] = version
+    env["UNATTENDED"] = "1"
+    info(f"building osxcross with {newest} (takes 5–20 minutes)")
+    if not run_logged(["./build.sh"], cwd=root, env=env, log_path=new_log_path("osxcross_build"),
+                      title=f"Building osxcross (macOS SDK {version or '?'})", state_key="osxcross_build",
+                      ctx=_plain_ctx(), task_id="osxcross:build"):
+        raise BuildError("osxcross failed to build. Missing development headers are the usual cause"
+                         + (f": {osxcross_packages()}" if osxcross_packages() else "."))
+    if not list((root / "target" / "bin").glob("x86_64-apple-darwin*-clang")):
+        raise BuildError("osxcross built but no x86_64-apple-darwin clang wrapper was found in target/bin.")
+    (root / ".gbm-version").write_text(f"SDK {version}\n")
+    remember_toolchain("osxcross_root", root)
+    ok(f"osxcross installed in {root}")
+    return root
+
+
+def cmd_toolchain(_ctx: None, args: argparse.Namespace) -> int:
+    if args.action == "status":
+        status = toolchain_status()
+        if JSON_MODE:
+            emit("toolchains", **status)
+            return 0
+        heading("Toolchains")
+        for key, label in (("mingw", "llvm-mingw (Windows)"), ("osxcross", "osxcross (macOS)"),
+                           ("moltenvk", "MoltenVK (macOS Vulkan)")):
+            item = status[key]
+            if item["installed"]:
+                ok(f"{label:<26} {item['path']}  {S.dim(item.get('version') or item.get('sdk') or '')}")
+            else:
+                warn(f"{label:<26} not installed  {S.dim('godot-build toolchain install ' + key)}")
+        return 0
+    names = ["mingw", "moltenvk", "osxcross"] if args.name == "all" else [args.name]
+    if args.action == "remove":
+        for name in names:
+            folder = TOOLCHAIN_DIR / {"mingw": "llvm-mingw"}.get(name, name)
+            if folder.is_dir():
+                shutil.rmtree(folder)
+                ok(f"removed {folder}")
+            if (name == "mingw" and LLVM_MINGW_DIR == folder) or name == "osxcross":
+                remember_toolchain({"mingw": "llvm_mingw", "osxcross": "osxcross_root"}[name], None)
+        emit("toolchains", **toolchain_status())
+        return 0
+    failed = 0
+    for name in names:
+        try:
+            if name == "mingw":
+                install_mingw()
+            elif name == "moltenvk":
+                install_moltenvk()
+            elif args.name == "all" and not args.sdk and not list(
+                    (TOOLCHAIN_DIR / "osxcross" / "tarballs").glob("MacOSX*.sdk.tar.*")):
+                skip("osxcross: pass --sdk with an Xcode .xip or MacOSX SDK archive to build it")
+            else:
+                install_osxcross(args.sdk)
+        except BuildError as exc:
+            fail(str(exc))
+            failed += 1
+    emit("toolchains", **toolchain_status())
+    if not failed and "mingw" in names:
+        info("Windows builds also need ANGLE / D3D12 / Mesa: run  godot-build deps")
+    return 1 if failed else 0
+
+
+# ==============================================================================
 #  First-run setup
 # ==============================================================================
 
@@ -2835,6 +3145,7 @@ def status_snapshot(ctx: Context) -> dict:
         "key": key,
         "platforms": platforms,
         "osxcross": {"root": str(ctx.osxcross_root) if ctx.osxcross_root else None, "sdk": ctx.osxcross_sdk},
+        "toolchains": toolchain_status(),
         "staged": staged,
         "installed_templates": installed,
         "paths": {"dist": str(DIST_DIR), "logs": str(LOG_DIR), "templates": str(USER_TEMPLATES_DIR),
@@ -3009,6 +3320,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_install)
     p = sub.add_parser("deps", parents=[common], help="download AccessKit / ANGLE / D3D12 SDKs")
     p.set_defaults(func=cmd_deps)
+    p = sub.add_parser("toolchain", parents=[common],
+                       help="install cross-compilers: llvm-mingw (Windows), osxcross + MoltenVK (macOS)")
+    p.add_argument("action", nargs="?", choices=["status", "install", "remove"], default="status")
+    p.add_argument("name", nargs="?", choices=["mingw", "osxcross", "moltenvk", "all"], default="all")
+    p.add_argument("--sdk", help="osxcross: Xcode .xip or MacOSX<version>.sdk.tar.xz to build against")
+    p.set_defaults(func=cmd_toolchain)
 
     p = sub.add_parser("launch", parents=[common], help="open Godot, then check for updates in the background")
     p.add_argument("godot_args", nargs=argparse.REMAINDER, help="arguments for Godot (after --)")
@@ -3053,7 +3370,7 @@ def dispatch(parser: argparse.ArgumentParser, argv: list[str], show_banner: bool
         Style.enabled = False
     if args.command == "launch":
         return cmd_launch(args)
-    if args.command in ("setup", "clone"):
+    if args.command in ("setup", "clone", "toolchain"):
         try:
             code = args.func(None, args)
         except BuildError as exc:

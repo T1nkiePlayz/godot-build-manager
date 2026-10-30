@@ -50,7 +50,7 @@ Manager does all of that for you, with a GTK 4 interface that follows your deskt
 | 📝 **Readable changelog** | Incoming changes appear as pull request titles grouped by engine area (Rendering, C#, Windows…), with the areas you care about highlighted. |
 | 📈 **Build history** | Duration chart per build step, ccache hit rates, and a realistic *time left* while building. |
 | 💾 **Storage** | See what caches, objects, snapshots and old templates cost on disk and clean them up safely. |
-| 🩺 **Diagnostics** | Checks compilers, SCons, toolchains, SDKs, the key and the desktop integration, with one-click fixes. |
+| 🩺 **Diagnostics** | Checks compilers, SCons, toolchains, SDKs, the key and the desktop integration, with one-click fixes — including installers for the Windows and macOS cross-compilers. |
 | 🖥️ **Desktop integration** | Godot in your app launcher, `.godot` files open with your build, and right-click actions for the Build Manager and update checks. |
 
 Everything the app does is also a plain command (`godot-build editor`, `godot-build templates --install`, …),
@@ -129,6 +129,9 @@ You can close the window during a build and let it finish in the background — 
 ```bash
 godot-build setup --source-dir ~/src/godot   # or: godot-build clone ~/src/godot
 godot-build doctor                           # what is installed, what is missing
+godot-build toolchain install mingw          # Windows cross-compiler (+ `godot-build deps`)
+godot-build toolchain install moltenvk       # Vulkan for macOS templates
+godot-build toolchain install osxcross --sdk ~/Downloads/Xcode_26.xip
 godot-build editor                           # optimized editor (+ C# glue when .NET is on)
 godot-build key generate                     # create the PCK encryption key
 godot-build templates --install              # every available platform, release + debug
@@ -146,6 +149,7 @@ godot-build integrate                        # launcher entry, icons, .godot fil
 | `setup` | Set the source tree, workspace, llvm-mingw and osxcross folders. |
 | `clone DIR` | Clone Godot from GitHub (`--branch`, `--shallow`) and use it. |
 | `doctor` | Check toolchains and dependencies. |
+| `toolchain` | `status`, `install mingw\|osxcross\|moltenvk\|all` (`--sdk FILE` for osxcross), `remove NAME`. |
 | `editor` | Build the Linux editor (`--mono` / `--no-mono`, `--no-glue`, `-j N`, `-- extra scons args`). |
 | `templates` | Build export templates (`-p`, `-t`, `--arch`, `--install`, `--tpz`, `--keep-going`, `--no-encrypt`, `--require-encryption`). |
 | `all` | Doctor, editor, templates and install in one go. |
@@ -184,16 +188,26 @@ compiled with your key. The manager handles the whole chain:
 
 ## Cross-compiling for Windows and macOS
 
-**Windows** templates use [llvm-mingw](https://github.com/mstorsjo/llvm-mingw). Extract a release to `/opt/llvm-mingw`
-or `~/llvm-mingw` (or set the folder in Settings), then run **Diagnostics → Download Windows build dependencies**
-for ANGLE, Direct3D 12 and AccessKit.
+Open **Diagnostics → Cross-Compile Toolchains** (or use `godot-build toolchain`). Everything is installed into
+`<workspace>/toolchains`, with live progress on the Activity page, and is picked up automatically.
 
-**macOS** templates use [osxcross](https://github.com/tpoechtrager/osxcross) and are combined into one universal
-(arm64 + x86_64) template with `lipo`. Build osxcross with a macOS SDK packaged from Xcode — check the Xcode license
-terms before doing so — and point the manager at it in Settings. For Vulkan on macOS, set `_MOLTENVK_SDK` in
-`custom.py`; otherwise Metal and OpenGL are used.
+| Toolchain | Used for | What the installer does |
+|---|---|---|
+| [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) | Windows templates | Downloads the latest Linux release (~85 MB), then Godot's Windows dependencies (ANGLE, Direct3D 12, Mesa NIR, AccessKit). |
+| [osxcross](https://github.com/tpoechtrager/osxcross) | macOS templates | Clones osxcross, extracts the macOS SDK from the Xcode `.xip` you choose and builds the toolchain (5–20 minutes). |
+| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | Vulkan on macOS | Downloads the static `MoltenVK.xcframework` (~57 MB) and links it into macOS templates. |
 
-Platforms whose toolchain is missing are simply greyed out with the reason shown.
+**About the macOS SDK.** Apple only distributes it inside Xcode, so the manager cannot download it for you.
+Sign in at [developer.apple.com/download](https://developer.apple.com/download/all/?q=xcode) with a free Apple
+account, download an Xcode `.xip`, and choose it in the installer. A `MacOSX<version>.sdk.tar.xz` packaged on a Mac
+with osxcross's `gen_sdk_package.sh` works too. Read the Xcode licence first: it only permits use on Apple hardware.
+Building osxcross also needs `clang cmake git patch make xz cpio` plus the libxml2, OpenSSL, zlib and bzip2 development
+headers. The installer lists anything missing with the command for your distribution.
+
+macOS templates are combined into one universal (arm64 + x86_64) template with `lipo`. Apple Silicon uses Metal.
+Without MoltenVK, Intel Macs fall back to OpenGL. **Settings → Vulkan on macOS** turns MoltenVK off again.
+
+Platforms whose toolchain is missing are greyed out on the Export Templates page, with a **Set Up Toolchains…** button.
 
 ## Configuration
 
@@ -203,8 +217,10 @@ Settings are stored in `~/.config/godot-build-manager/config.json` and are all e
 |---|---|
 | `source_dir` | *(set on first run)* |
 | `workspace_dir` | `~/.local/share/godot-build-manager` |
-| `llvm_mingw` | auto-detected: `/opt/llvm-mingw`, `~/llvm-mingw`, `PATH` |
-| `osxcross_root` | auto-detected: `~/osxcross`, `<workspace>/osxcross` |
+| `llvm_mingw` | auto-detected: `<workspace>/toolchains/llvm-mingw`, `/opt/llvm-mingw`, `~/llvm-mingw`, `PATH` |
+| `osxcross_root` | auto-detected: `<workspace>/toolchains/osxcross`, `~/osxcross` |
+| `moltenvk_sdk` | auto-detected: `<workspace>/toolchains/moltenvk` |
+| `macos_vulkan` | `true` |
 | `manager_in_launcher` | `true` |
 | `auto_check`, `auto_check_hours` | `true`, `6` |
 | `watch_paths` | `modules/mono, editor/export, platform/linuxbsd, platform/windows, core/crypto` |
@@ -221,6 +237,7 @@ Environment variables override the file: `GODOT_SOURCE`, `GBM_WORKSPACE`, `GBM_C
 ├── logs/                   build logs, history.jsonl, state
 ├── dist/                   staged templates, manifests, .tpz packages
 ├── snapshots/              previous editor builds (+ GodotSharp)
+├── toolchains/             llvm-mingw, osxcross, MoltenVK
 └── nuget/                  local NuGet feed for .NET builds
 ```
 

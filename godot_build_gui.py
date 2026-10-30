@@ -50,9 +50,16 @@ except (ValueError, ImportError):
 APP_ID = "io.github.t1nkieplayz.GodotBuildManager"
 REPO_URL = "https://github.com/T1nkiePlayz/godot-build-manager"
 APP_NAME = "Godot Build Manager"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BACKEND = Path(__file__).resolve().with_name("godot_build.py")
 RELEASE_NOTES = """
+<p>New in 1.2.0:</p>
+<ul>
+  <li>Cross-compile toolchains installer on the Diagnostics page: llvm-mingw for Windows, osxcross and MoltenVK for macOS</li>
+  <li>osxcross is built from an Xcode download or a packaged macOS SDK, with live progress</li>
+  <li>New setting: Vulkan on macOS (MoltenVK), so Intel Macs get Vulkan instead of OpenGL</li>
+  <li>Export Templates links straight to toolchain setup when Windows or macOS is unavailable</li>
+</ul>
 <p>New in 1.1.0:</p>
 <ul>
   <li>Editor snapshots: every successful build is kept, and the launcher can roll back to any of them</li>
@@ -1139,6 +1146,11 @@ class TemplatesPage(Page):
         self.arch_rows: dict[tuple[str, str], Adw.SwitchRow] = {}
         self.platforms_group = Adw.PreferencesGroup(
             title="Platforms", description="Linux and Windows build here directly; macOS needs osxcross.")
+        self.setup_toolchains = button("Set Up Toolchains…", None, "flat",
+                                       tooltip="Install the Windows and macOS cross-compilers",
+                                       on_click=lambda: self.win.navigate("diagnostics"))
+        self.setup_toolchains.set_visible(False)
+        self.platforms_group.set_header_suffix(self.setup_toolchains)
 
         targets = Adw.PreferencesGroup(title="Targets")
         self.sw_release = Adw.SwitchRow(title="Release", subtitle="Shipped builds · fully optimised",
@@ -1227,9 +1239,12 @@ class TemplatesPage(Page):
             info = platforms.get(key, {})
             available = info.get("available", False)
             row.set_sensitive(available)
-            if not available:
+            if available:
+                row.set_subtitle("")
+            else:
                 row.set_enable_expansion(False)
                 row.set_subtitle(GLib.markup_escape_text(info.get("reason") or "Unavailable"))
+        self.setup_toolchains.set_visible(any(not p.get("available", False) for p in platforms.values()))
         if not self._mono_initialised:
             self.sw_mono.set_active(self.saved.get("mono", status.get("mono_default", False)))
             self._mono_initialised = True
@@ -2446,6 +2461,25 @@ class DiagnosticsPage(Page):
         self.summary_stack.add_named(self.summary_box, "summary")
         header.add(self.summary_stack)
 
+        self.chains = Adw.PreferencesGroup(
+            title="Cross-Compile Toolchains",
+            description="Everything needed to build Windows and macOS templates on Linux. Downloads and builds "
+                        "go into the workspace's toolchains folder.")
+        self.chain_rows: dict[str, tuple[Adw.ActionRow, Gtk.Image, Gtk.Button]] = {}
+        for key, title, handler in (
+                ("mingw", "Windows · llvm-mingw", self._install_mingw),
+                ("osxcross", "macOS · osxcross", self._install_osxcross),
+                ("moltenvk", "macOS · MoltenVK (Vulkan)", self._install_moltenvk)):
+            row = Adw.ActionRow(title=title)
+            row.set_subtitle_lines(3)
+            state = Gtk.Image()
+            row.add_prefix(state)
+            install = button("Install", None, on_click=handler)
+            install.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(install)
+            self.chains.add(row)
+            self.chain_rows[key] = (row, state, install)
+
         tools = Adw.PreferencesGroup(title="Fix-ups")
         deps = action_row("Download Windows build dependencies",
                           "ANGLE, Direct3D 12 Agility SDK, Mesa NIR, PIX and AccessKit",
@@ -2460,13 +2494,110 @@ class DiagnosticsPage(Page):
                            on_activate=lambda: self.win.run_integrate(False))
         tools.add(integ)
 
-        self.page = self.make_page(header, tools)
+        self.page = self.make_page(header, self.chains, tools)
         self.tools_group = tools
         self.set_child(self.page)
 
     def shown(self):
         if not self.ran and not self.running:
             self.run()
+
+    def update(self, status):
+        super().update(status)
+        chains = status.get("toolchains") or {}
+        for key, (row, state, install) in self.chain_rows.items():
+            item = chains.get(key, {})
+            installed = item.get("installed", False)
+            if key == "mingw":
+                text = (f"{item.get('path')} {item.get('version', '')}" if installed else
+                        "Not installed · downloads the latest llvm-mingw release (~85 MB), "
+                        "then Godot's Windows dependencies")
+            elif key == "osxcross":
+                missing = item.get("missing_tools") or []
+                text = (f"{item.get('path')} · SDK {item.get('sdk') or '?'}" if installed else
+                        "Not installed · built from Apple's macOS SDK (Xcode download), takes 5–20 minutes")
+                if missing and not installed:
+                    text += f"\nNeeds {', '.join(missing)}" + (f": {item['packages']}" if item.get("packages") else "")
+            else:
+                text = (f"{item.get('version', '')} · Intel Macs get Vulkan instead of OpenGL" if installed else
+                        "Not installed · Vulkan for macOS templates (~57 MB). Without it Intel Macs fall back "
+                        "to OpenGL; Apple Silicon uses Metal either way")
+                if installed and not item.get("enabled", True):
+                    text = f"{item.get('version', '')} · turned off in Settings (Vulkan on macOS)"
+            row.set_subtitle(GLib.markup_escape_text(text.strip()))
+            state.set_from_icon_name(icon("emblem-ok-symbolic", "object-select-symbolic") if installed
+                                     else icon("dialog-warning-symbolic"))
+            for css in ("success", "warning"):
+                state.remove_css_class(css)
+            state.add_css_class("success" if installed else "warning")
+            install.set_label("Reinstall" if installed else "Install")
+            install.remove_css_class("suggested-action")
+            if not installed:
+                install.add_css_class("suggested-action")
+
+    def _install_mingw(self):
+        ops = [Operation("Install llvm-mingw", ["toolchain", "install", "mingw"],
+                         icon_name="folder-download-symbolic")]
+        if not getattr(self.win, "needs_setup", False):
+            ops.append(Operation("Download Windows build dependencies", ["deps"], icon_name="folder-download-symbolic"))
+        self.win.run_heavy(ops, "Set Up Windows Toolchain")
+
+    def _install_moltenvk(self):
+        self.win.run_heavy([Operation("Install MoltenVK", ["toolchain", "install", "moltenvk"],
+                                      icon_name="folder-download-symbolic")])
+
+    def _install_osxcross(self):
+        item = (self.status.get("toolchains") or {}).get("osxcross", {})
+        archives = item.get("sdk_archives") or []
+        dialog = Adw.AlertDialog(
+            heading="Install osxcross",
+            body="osxcross needs Apple's macOS SDK, which Apple only distributes inside Xcode. Download Xcode "
+                 "(a .xip file, free Apple account) from Apple's developer site, then choose it here. A "
+                 "MacOSX<version>.sdk.tar.xz packaged on a Mac with osxcross's gen_sdk_package.sh works too.\n\n"
+                 "Building takes 5–20 minutes. Apple's licence allows the SDK only for building on or for "
+                 "Apple hardware.")
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("xcode", "_Get Xcode")
+        if archives:
+            dialog.add_response("existing", f"_Use {archives[-1]}")
+        dialog.add_response("choose", "_Choose File…")
+        dialog.set_response_appearance("choose", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("choose")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response == "xcode":
+                Gtk.UriLauncher.new("https://developer.apple.com/download/all/?q=xcode").launch(self.win, None, None)
+            elif response == "existing":
+                self._run_osxcross(None)
+            elif response == "choose":
+                self._choose_sdk()
+
+        dialog.connect("response", on_response)
+        dialog.present(self.win)
+
+    def _choose_sdk(self):
+        sdk_filter = Gtk.FileFilter(name="Xcode or macOS SDK")
+        for pattern in ("*.xip", "MacOSX*.sdk.tar.*"):
+            sdk_filter.add_pattern(pattern)
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(sdk_filter)
+        downloads = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or str(Path.home())
+        dialog = Gtk.FileDialog(title="Choose Xcode or a macOS SDK", filters=filters, default_filter=sdk_filter,
+                                initial_folder=Gio.File.new_for_path(downloads))
+
+        def chosen(dlg, result):
+            try:
+                self._run_osxcross(dlg.open_finish(result).get_path())
+            except GLib.Error:
+                return
+
+        dialog.open(self.win, None, chosen)
+
+    def _run_osxcross(self, sdk: str | None):
+        args = ["toolchain", "install", "osxcross"] + (["--sdk", sdk] if sdk else [])
+        self.win.run_heavy([Operation("Build osxcross", args, icon_name="system-run-symbolic")],
+                           "Set Up macOS Toolchain")
 
     def run(self):
         if self.running:
