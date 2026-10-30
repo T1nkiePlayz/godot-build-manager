@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2433"/>
+      <stop offset=".55" stop-color="#22324a"/>
+      <stop offset="1" stop-color="#1d4a6e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".18" cy=".5" r=".45">
+      <stop offset="0" stop-color="#478cbf" stop-opacity=".45"/>
+      <stop offset="1" stop-color="#478cbf" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5a9fd6"/><stop offset="1" stop-color="#36709f"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3ddc84"/><stop offset="1" stop-color="#1f9e5b"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#fff" stroke-opacity=".04"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="360" rx="24" fill="url(#sky)"/>
+  <rect width="1280" height="360" rx="24" fill="url(#grid)"/>
+  <rect width="1280" height="360" rx="24" fill="url(#glow)"/>
+
+  <g transform="translate(120 84) scale(1.5)">
+    <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#tile)"/>
+    <rect x="8" y="8" width="112" height="56" rx="26" fill="#fff" opacity=".08"/>
+    <g transform="translate(56 56)">
+      <circle r="31" fill="none" stroke="#fff" stroke-width="13" stroke-dasharray="12.17 12.17"/>
+      <circle r="26" fill="#fff"/>
+      <circle r="11" fill="#36709f"/>
+      <path d="M-5-2h10l-5 7z" fill="#fff" opacity=".9"/>
+    </g>
+    <circle cx="96" cy="96" r="27" fill="url(#badge)" stroke="#fff" stroke-width="4"/>
+    <path d="M96 82v22m-9-9 9 9 9-9" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <g font-family="Inter, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" fill="#fff">
+    <text x="372" y="150" font-size="58" font-weight="800" letter-spacing="-1">Godot Build Manager</text>
+    <text x="374" y="196" font-size="24" fill="#c5d4e6">Build the Godot editor and export templates from source —</text>
+    <text x="374" y="228" font-size="24" fill="#c5d4e6">encrypted, versioned and one click away.</text>
+    <g font-size="16" font-weight="700">
+      <rect x="374" y="258" width="92" height="32" rx="16" fill="#478cbf" fill-opacity=".35"/>
+      <text x="420" y="279" text-anchor="middle">Linux</text>
+      <rect x="476" y="258" width="112" height="32" rx="16" fill="#478cbf" fill-opacity=".35"/>
+      <text x="532" y="279" text-anchor="middle">Windows</text>
+      <rect x="598" y="258" width="98" height="32" rx="16" fill="#478cbf" fill-opacity=".35"/>
+      <text x="647" y="279" text-anchor="middle">macOS</text>
+      <rect x="706" y="258" width="150" height="32" rx="16" fill="#3ddc84" fill-opacity=".25"/>
+      <text x="781" y="279" text-anchor="middle">PCK encryption</text>
+      <rect x="866" y="258" width="142" height="32" rx="16" fill="#3ddc84" fill-opacity=".25"/>
+      <text x="937" y="279" text-anchor="middle">GTK 4 · Adwaita</text>
+    </g>
+  </g>
+</svg>

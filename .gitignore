@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.tmp
+*.bak
+# Never commit encryption keys or key backups
+*.gdkey
+*.gdkey.bak
+godot-pck-key-*.asc

@@ -1,0 +1,271 @@
+# ==============================================================================
+#  custom.py - Godot Engine production build configuration
+#  (template shipped with Godot Build Manager; copy into your Godot checkout)
+# ==============================================================================
+#
+#  Loaded automatically by SCons from the source root. It is plain Python, so
+#  options are chosen per build target below. Anything passed on the command
+#  line always wins over this file, e.g.:
+#
+#      scons debug_symbols=yes          # one-off override
+#      scons profile=my_other_profile   # layer another options file on top
+#
+#  Usage:
+#      scons                            # optimized editor (this machine only)
+#      scons target=template_release    # portable release export template
+#      scons target=template_debug      # portable debug export template
+#      scons platform=windows target=template_release arch=x86_64
+#      scons platform=macos target=template_release arch=arm64
+#
+#  For full template sets (all platforms, encryption, packaging, install) use
+#  Godot Build Manager (godot_build.py / godot_build_gui.py) instead of calling
+#  scons directly. Its Settings page edits the toggles below for you.
+#
+#  Output lands in bin/, objects in bin/obj/.
+#
+#  NOTE: SCons executes this file with an empty globals dict, so module-level
+#  names are NOT visible inside functions. Keep logic flat (no helper defs).
+# ==============================================================================
+
+import os
+import shutil
+import sys
+
+# ------------------------------------------------------------------------------
+#  Toggles - the knobs you are most likely to change
+# ------------------------------------------------------------------------------
+
+# Tune the *editor*'s instruction scheduling for the CPU that builds it.
+# Tuning only (-mtune=native): -march=native / x86-64-v3 are NOT safe, they
+# define __AVX2__ globally and break Godot's SSE2-only Embree build
+# (undefined embree::avx2::* at link time).
+# Never applied to export templates: they must run on players' machines.
+_NATIVE_EDITOR = True
+
+# Keep symbols in a separate .debug file next to the binary, so crashes give
+# readable backtraces without bloating the shipped executable. Costs link time.
+_SEPARATE_DEBUG_SYMBOLS = False
+
+# Build C#/.NET support. Requires the .NET SDK (`dotnet`) and an extra step
+# afterwards to generate the glue (see the Godot docs: "Compiling with .NET").
+_DOTNET = False
+
+# Strip 3D, XR and 3D-only modules from export templates to cut size and load
+# time. Only enable once the game is certain to be 2D-only.
+_SLIM_2D_TEMPLATES = False
+
+# Persistent SCons object cache: makes rebuilds after `git pull` much faster.
+_CACHE_DIR = "~/.cache/godot-scons"
+_CACHE_LIMIT_GIB = 15
+
+# Windows cross-compiler (llvm-mingw). MINGW_PREFIX in the environment wins.
+_LLVM_MINGW = "/opt/llvm-mingw"
+
+# macOS: MoltenVK (Vulkan on macOS) SDK folder containing
+# MoltenVK/MoltenVK.xcframework. Empty = build macOS without Vulkan
+# (Metal on Apple Silicon, OpenGL on Intel Macs).
+_MOLTENVK_SDK = ""
+
+# ------------------------------------------------------------------------------
+#  Resolve the requested target/platform (command line, else SCons defaults)
+# ------------------------------------------------------------------------------
+
+_target = "editor"
+_platform = "linuxbsd"
+_arg = None
+for _arg in sys.argv[1:]:
+    if _arg.startswith("target="):
+        _target = _arg.split("=", 1)[1].lower()
+    elif _arg.startswith(("platform=", "p=")):
+        _platform = _arg.split("=", 1)[1].lower()
+
+_platform = {"linux": "linuxbsd", "osx": "macos"}.get(_platform, _platform)
+_is_editor = _target == "editor"
+_is_release = _target == "template_release"
+
+# ------------------------------------------------------------------------------
+#  Platform and toolchain
+# ------------------------------------------------------------------------------
+
+platform = _platform
+# `arch` is deliberately not pinned: it defaults to the host, and the build
+# script passes it explicitly for cross builds (e.g. macOS arm64 + x86_64).
+
+# Statically link the C++ runtime so binaries run on other distros / PCs.
+use_static_cpp = True
+
+_launcher = None
+
+if _platform == "linuxbsd":
+    if shutil.which("clang"):
+        # Clang + ThinLTO: near full-LTO performance with parallel, low-RAM linking.
+        use_llvm = True
+        if shutil.which("mold"):
+            linker = "mold"
+        elif shutil.which("ld.lld"):
+            linker = "lld"
+        lto = "thin"
+    else:
+        lto = "auto"  # GCC: let Godot pick (full LTO for production builds)
+
+elif _platform == "windows":
+    # llvm-mingw cross-compiler: ThinLTO fits in 16 GB, unlike GCC full LTO.
+    use_mingw = True
+    use_llvm = True
+    mingw_prefix = os.environ.get("MINGW_PREFIX") or _LLVM_MINGW
+    lto = "thin"
+    d3d12 = True  # Deps live in bin/build_deps (install_d3d12_sdk_windows.py).
+    angle = True  # Deps live in bin/build_deps (install_angle.py).
+
+elif _platform == "macos":
+    # osxcross (OSXCROSS_ROOT). Godot keeps LTO off on macOS by default: the
+    # benefit is unproven and ld64 LTO through osxcross is fragile.
+    lto = "none"
+    if _MOLTENVK_SDK:
+        vulkan_sdk_path = _MOLTENVK_SDK
+    else:
+        vulkan = False
+
+else:
+    lto = "auto"
+
+# Prefer sccache/ccache when installed. osxcross wires ccache itself through
+# the CCACHE environment variable, so it is skipped there to avoid nesting.
+if _platform != "macos":
+    _launcher = shutil.which("sccache") or shutil.which("ccache")
+    if _launcher:
+        c_compiler_launcher = _launcher
+        cpp_compiler_launcher = _launcher
+
+# ------------------------------------------------------------------------------
+#  Optimization
+# ------------------------------------------------------------------------------
+
+# `production` = use_static_cpp + no debug symbols + platform-preferred LTO.
+# LTO is pinned per platform above so it never silently changes.
+production = True
+
+# speed       - most aggressive; best for shipped games.
+# speed_trace - same, but keeps frame info for usable crash backtraces.
+optimize = "speed" if _is_release else "speed_trace"
+
+# Godot passes -ffp-contract=off deliberately for float determinism across
+# platforms, so never add -ffast-math / -Ofast here.
+if _is_editor and _NATIVE_EDITOR and _platform == "linuxbsd":
+    ccflags = "-mtune=native"
+
+# ------------------------------------------------------------------------------
+#  Debug info
+# ------------------------------------------------------------------------------
+
+debug_symbols = _SEPARATE_DEBUG_SYMBOLS
+separate_debug_symbols = _SEPARATE_DEBUG_SYMBOLS
+debug_paths_relative = True
+
+# ------------------------------------------------------------------------------
+#  Engine features
+# ------------------------------------------------------------------------------
+
+precision = "single"
+deprecated = True  # Keep compat code; projects and addons still rely on it.
+threads = True
+
+if _platform == "linuxbsd":
+    # Linux display/audio/input backends, loaded dynamically at runtime
+    # (sowrap) so the binary still starts on systems missing any of them.
+    use_sowrap = True
+    x11 = True
+    wayland = True
+    libdecor = True
+    pulseaudio = True
+    alsa = True
+    dbus = True
+    speechd = True
+    fontconfig = True
+    udev = True
+    vulkan = True
+
+sdl = True
+accesskit = True
+opengl3 = True
+
+# A self-built master/beta editor would otherwise nag about stable releases.
+engine_update_check = False
+
+# Fail-safe: never ship test code or dev-only checks in a production build.
+tests = False
+dev_build = False
+dev_mode = False
+strict_checks = False
+scu_build = False  # SCU is a dev-iteration speedup; can hide include bugs.
+
+if _DOTNET:
+    module_mono_enabled = True
+
+# ------------------------------------------------------------------------------
+#  Export template trimming
+# ------------------------------------------------------------------------------
+
+if not _is_editor:
+    # Players can't override main pack / scene / run scripts via CLI args.
+    disable_path_overrides = True
+
+    if _SLIM_2D_TEMPLATES:
+        disable_3d = True
+        disable_physics_3d = True
+        disable_navigation_3d = True
+        disable_xr = True
+        module_openxr_enabled = False
+        module_webxr_enabled = False
+        module_mobile_vr_enabled = False
+        module_visionos_xr_enabled = False
+        module_jolt_physics_enabled = False
+        module_godot_physics_3d_enabled = False
+        module_navigation_3d_enabled = False
+        module_gridmap_enabled = False
+        module_csg_enabled = False
+        module_lightmapper_rd_enabled = False
+        module_xatlas_unwrap_enabled = False
+        module_vhacd_enabled = False
+        module_fbx_enabled = False
+        module_gltf_enabled = False
+        module_meshoptimizer_enabled = False
+        module_raycast_enabled = False
+
+    # For class-level stripping, generate a profile from the editor
+    # (Project > Tools > Engine Compilation Configuration Editor) and set:
+    # build_profile = "/path/to/my_game.gdbuild"
+
+# ------------------------------------------------------------------------------
+#  Build housekeeping
+# ------------------------------------------------------------------------------
+
+if _CACHE_DIR:
+    _CACHE_DIR = os.path.expanduser(_CACHE_DIR)
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    cache_path = _CACHE_DIR
+    cache_limit = str(_CACHE_LIMIT_GIB)
+
+redirect_build_objects = True
+progress = True
+
+# Only print the summary once (SCons may evaluate this file more than once).
+if os.environ.get("_GODOT_CUSTOM_PY_ANNOUNCED") != "1":
+    os.environ["_GODOT_CUSTOM_PY_ANNOUNCED"] = "1"
+    print(
+        "custom.py: platform=%s target=%s optimize=%s lto=%s cache=%s launcher=%s"
+        % (
+            _platform,
+            _target,
+            optimize,
+            lto,
+            _CACHE_DIR or "off",
+            os.path.basename(_launcher) if _launcher else "none",
+        )
+    )
+
+# Drop helpers so SCons doesn't record them as unknown variables.
+del _arg, _target, _platform, _is_editor, _is_release, _launcher
+del _NATIVE_EDITOR, _SEPARATE_DEBUG_SYMBOLS, _DOTNET, _SLIM_2D_TEMPLATES
+del _CACHE_DIR, _CACHE_LIMIT_GIB, _LLVM_MINGW, _MOLTENVK_SDK
+del os, shutil, sys
