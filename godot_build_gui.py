@@ -50,9 +50,16 @@ except (ValueError, ImportError):
 APP_ID = "io.github.t1nkieplayz.GodotBuildManager"
 REPO_URL = "https://github.com/T1nkiePlayz/godot-build-manager"
 APP_NAME = "Godot Build Manager"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 BACKEND = Path(__file__).resolve().with_name("godot_build.py")
 RELEASE_NOTES = """
+<p>New in 1.2.3:</p>
+<ul>
+  <li>osxcross is built with its "latest" flavour (ld64 956), which can link MoltenVK into macOS templates</li>
+  <li>With an older osxcross, macOS templates build without Vulkan instead of failing, and Diagnostics says to reinstall</li>
+  <li>osxcross builds with very new host compilers (Clang 23), whose new warnings broke its libdispatch dependency</li>
+  <li>macOS templates link the compiler-rt OS version checks (fixes undefined ___isPlatformVersionAtLeast)</li>
+</ul>
 <p>New in 1.2.2:</p>
 <ul>
   <li>osxcross installer picks the newest macOS SDK osxcross supports (Xcode 27.2 ships SDKs osxcross only knows as 27)</li>

@@ -354,7 +354,7 @@ class Job:
         if self.platform.key == "macos":
             if ctx.osxcross_sdk:
                 args.append(f"osxcross_sdk={ctx.osxcross_sdk}")
-            args += macos_vulkan_args(ctx.source)
+            args += macos_vulkan_args(ctx.source) + macos_link_args()
         if ctx.jobs:
             args.append(f"-j{ctx.jobs}")
         return args + list(ctx.extra_scons_args)
@@ -1060,10 +1060,15 @@ def cmd_doctor(ctx: Context, args: argparse.Namespace | None = None) -> int:
               required=False)
     mvk = custom_py_value(ctx.source, "_MOLTENVK_SDK") or str(moltenvk_dir() or "")
     vulkan_on = bool(custom_py_value(ctx.source, "_MOLTENVK_SDK")) or manager_settings().get("macos_vulkan", True)
-    check("MoltenVK (macOS)", bool(mvk) and vulkan_on, mvk,
-          ("not installed: macOS templates fall back to OpenGL on Intel Macs "
-           "(Diagnostics → Toolchains, or: godot-build toolchain install moltenvk)") if vulkan_on else
-          "Vulkan on macOS is turned off in Settings (macos_vulkan)", required=False)
+    ld64 = osxcross_ld64(ctx.osxcross_root)
+    if mvk and vulkan_on and ld64 and ld64 < MIN_LD64_FOR_MOLTENVK:
+        check("MoltenVK (macOS)", False, "", f"osxcross has ld64-{ld64}, too old to link MoltenVK (needs "
+              f"{MIN_LD64_FOR_MOLTENVK}+): macOS builds skip Vulkan until osxcross is reinstalled", required=False)
+    else:
+        check("MoltenVK (macOS)", bool(mvk) and vulkan_on, mvk,
+              ("not installed: macOS templates fall back to OpenGL on Intel Macs "
+               "(Diagnostics → Toolchains, or: godot-build toolchain install moltenvk)") if vulkan_on else
+              "Vulkan on macOS is turned off in Settings (macos_vulkan)", required=False)
 
     heading("Machine")
     free_gb = shutil.disk_usage(ctx.source).free / 1024**3
@@ -2734,6 +2739,76 @@ def moltenvk_dir() -> Path | None:
     return None
 
 
+# Prebuilt MoltenVK is compiled with Objective-C selector stubs (`_objc_msgSend$sel`), which only
+# ld64 820+ (Xcode 14) synthesises. osxcross's "stable" flavour ships ld64 711.
+MIN_LD64_FOR_MOLTENVK = 820
+
+
+def osxcross_ld64(root: Path | None) -> int:
+    """ld64 version of an osxcross install (0 when unknown)."""
+    for ld in sorted((root / "target" / "bin").glob("*-apple-darwin*-ld")) if root else []:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            out = subprocess.run([str(ld), "-v"], capture_output=True, text=True, timeout=10)
+            if match := re.search(r"ld64-(\d+)", out.stdout + out.stderr):
+                return int(match.group(1))
+        break
+    return 0
+
+
+# `@available` checks call __isPlatformVersionAtLeast from compiler-rt, which distro clang does not ship
+# for Darwin (osxcross's build_compiler_rt.sh also lags new clang releases). Only that one file is needed.
+OS_VERSION_CHECK_URL = ("https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-21.1.8/"
+                        "compiler-rt/lib/builtins/os_version_check.c")
+
+
+def macos_builtins(root: Path | None) -> Path | None:
+    """Universal libclang_rt.osx.a with the OS version checks, built once with osxcross."""
+    if not root:
+        return None
+    out = root / "target" / "lib" / "gbm-builtins" / "libclang_rt.osx.a"
+    if out.is_file():
+        return out
+    bin_dir = root / "target" / "bin"
+    work = out.parent
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        source = work / "os_version_check.c"
+        if not source.is_file():
+            req = urllib.request.Request(OS_VERSION_CHECK_URL, headers={"User-Agent": "godot-build"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                source.write_bytes(resp.read())
+        slices = []
+        for arch in ("arm64", "x86_64"):
+            cc = next(iter(sorted(bin_dir.glob(f"{arch}-apple-darwin*-clang"))), None)
+            if not cc:
+                continue
+            obj = work / f"os_version_check.{arch}.o"
+            subprocess.run([str(cc), "-O2", "-mmacosx-version-min=11.0", "-c", str(source), "-o", str(obj)],
+                           check=True, capture_output=True, text=True)
+            slices.append(obj)
+        lipo = next(iter(sorted(bin_dir.glob("*-apple-darwin*-lipo"))), None)
+        if not slices or not lipo:
+            return None
+        objs = []
+        for obj in slices:  # one single-arch archive per slice, then lipo them together
+            arch = obj.suffixes[0][1:]
+            ar = next(iter(sorted(bin_dir.glob(f"{arch}-apple-darwin*-ar"))))
+            lib = obj.with_suffix(".a")
+            lib.unlink(missing_ok=True)
+            subprocess.run([str(ar), "rcs", str(lib), str(obj)], check=True, capture_output=True)
+            objs.append(str(lib))
+        subprocess.run([str(lipo), "-create", *objs, "-output", str(out)], check=True, capture_output=True)
+        return out
+    except (OSError, subprocess.CalledProcessError, StopIteration) as exc:
+        warn(f"Could not build the macOS compiler-rt builtins ({exc}); @available checks may fail to link.")
+        return None
+
+
+def macos_link_args() -> list[str]:
+    lib = macos_builtins(find_osxcross()[0])
+    return [f"linkflags={lib}"] if lib else []
+
+
 def macos_vulkan_args(source: Path) -> list[str]:
     """SCons args that link MoltenVK into macOS builds (unless custom.py already chose)."""
     if custom_py_value(source, "_MOLTENVK_SDK"):
@@ -2741,7 +2816,14 @@ def macos_vulkan_args(source: Path) -> list[str]:
     if not manager_settings().get("macos_vulkan", True):
         return ["vulkan=no"]
     mvk = moltenvk_dir()
-    return ["vulkan=yes", f"vulkan_sdk_path={mvk}"] if mvk else []
+    if not mvk:
+        return []
+    ld64 = osxcross_ld64(find_osxcross()[0])
+    if ld64 and ld64 < MIN_LD64_FOR_MOLTENVK:
+        warn(f"osxcross has ld64-{ld64}, too old to link MoltenVK: building macOS without Vulkan. "
+             "Reinstall osxcross (Diagnostics → Toolchains) to fix.")
+        return ["vulkan=no"]
+    return ["vulkan=yes", f"vulkan_sdk_path={mvk}"]
 
 
 def remember_toolchain(key: str, path: Path | None) -> None:
@@ -2765,6 +2847,7 @@ def toolchain_status() -> dict:
         "mingw": {"installed": mingw, "path": str(LLVM_MINGW_DIR) if mingw else None,
                   "version": _version_file(LLVM_MINGW_DIR) if mingw else ""},
         "osxcross": {"installed": bool(osx_root), "path": str(osx_root) if osx_root else None, "sdk": osx_sdk,
+                     "ld64": osxcross_ld64(osx_root),
                      "sdk_archives": sorted(p.name for p in tarballs.glob("MacOSX*.sdk.tar.*"))
                      if tarballs.is_dir() else [],
                      "missing_tools": [t for t in OSXCROSS_TOOLS if not shutil.which(t)],
@@ -2967,6 +3050,18 @@ def install_osxcross(sdk: str | None) -> Path:
     if version:
         env["SDK_VERSION"] = version
     env["UNATTENDED"] = "1"
+    # "latest" brings ld64 956: needed for MoltenVK and objects from current Xcode (stable is ld64 711).
+    env.setdefault("BUILD_FLAVOR", "latest")
+    # osxcross's CMake dependencies (libdispatch) build with -Werror -Wall, so every new host-compiler
+    # warning breaks them. CFLAGS can't help (the project's flags come later), so the compile rule itself
+    # appends -Wno-error after them. osxcross resets its sources each build, so patching them won't stick.
+    rules = TOOLCHAIN_DIR / "osxcross-no-werror.cmake"
+    rules.write_text("# Written by godot-build: lets osxcross dependencies build with newer host compilers.\n"
+                     'set(CMAKE_USER_MAKE_RULES_OVERRIDE "${CMAKE_CURRENT_LIST_FILE}")\n'
+                     + "".join(f'set(CMAKE_{lang}_COMPILE_OBJECT "<CMAKE_{lang}_COMPILER> <DEFINES> <INCLUDES> '
+                               f'<FLAGS> -Wno-error -o <OBJECT> -c <SOURCE>")\n' for lang in ("C", "CXX")))
+    env.setdefault("CMAKE_TOOLCHAIN_FILE", str(rules))
+    shutil.rmtree(root / "build" / "apple-libdispatch" / "build", ignore_errors=True)  # stale CMake cache
     info(f"building osxcross with {newest} (takes 5–20 minutes)")
     if not run_logged(["./build.sh"], cwd=root, env=env, log_path=new_log_path("osxcross_build"),
                       title=f"Building osxcross (macOS SDK {version or '?'})", state_key="osxcross_build",
@@ -2975,7 +3070,10 @@ def install_osxcross(sdk: str | None) -> Path:
                          "cause" + (f": {osxcross_packages()}" if osxcross_packages() else "."))
     if not list((root / "target" / "bin").glob("x86_64-apple-darwin*-clang")):
         raise BuildError("osxcross built but no x86_64-apple-darwin clang wrapper was found in target/bin.")
-    (root / ".gbm-version").write_text(f"SDK {version}\n")
+    shutil.rmtree(root / "target" / "lib" / "gbm-builtins", ignore_errors=True)
+    if not macos_builtins(root):
+        warn("macOS builds may fail with '___isPlatformVersionAtLeast' undefined (no compiler-rt builtins).")
+    (root / ".gbm-version").write_text(f"SDK {version} · {env['BUILD_FLAVOR']}\n")
     remember_toolchain("osxcross_root", root)
     ok(f"osxcross installed in {root}")
     return root

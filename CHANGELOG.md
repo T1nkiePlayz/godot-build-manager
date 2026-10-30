@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.3
+
+- **macOS templates with MoltenVK failed to link** with `Undefined symbols … _objc_msgSend$…`. Prebuilt MoltenVK uses
+  Objective-C selector stubs, which only ld64 820+ can link, and osxcross's default "stable" flavour ships ld64 711.
+  The installer now builds osxcross's "latest" flavour (ld64 956). Set `BUILD_FLAVOR` to override.
+- With an older osxcross, macOS templates build without Vulkan instead of failing, and Diagnostics says to reinstall
+  osxcross.
+- osxcross builds with very new host compilers: its libdispatch dependency compiles with `-Werror -Wall`, so Clang 23's new
+  warnings stopped the build. A CMake rule override now turns those errors back into warnings.
+- macOS templates failed to link with `___isPlatformVersionAtLeast` undefined. That function comes from compiler-rt,
+  which distribution clang doesn't ship for macOS, and osxcross's compiler-rt script doesn't support Clang 23 yet. The
+  manager now builds just that function (LLVM's `os_version_check.c`) into a universal `libclang_rt.osx.a` with
+  osxcross and links it into macOS builds.
+
 ## 1.2.2
 
 - **osxcross with newer Xcode versions:** an Xcode `.xip` contains the same SDK under several names (for example
