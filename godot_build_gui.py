@@ -50,9 +50,14 @@ except (ValueError, ImportError):
 APP_ID = "io.github.t1nkieplayz.GodotBuildManager"
 REPO_URL = "https://github.com/T1nkiePlayz/godot-build-manager"
 APP_NAME = "Godot Build Manager"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 BACKEND = Path(__file__).resolve().with_name("godot_build.py")
 RELEASE_NOTES = """
+<p>New in 1.2.2:</p>
+<ul>
+  <li>osxcross installer picks the newest macOS SDK osxcross supports (Xcode 27.2 ships SDKs osxcross only knows as 27)</li>
+  <li>Clear message when an SDK is newer than osxcross supports</li>
+</ul>
 <p>New in 1.2.1:</p>
 <ul>
   <li>When some template builds fail, the ones that succeeded are still installed into the editor</li>

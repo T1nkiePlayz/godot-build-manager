@@ -2893,6 +2893,31 @@ def _sdk_version(name: str) -> tuple[int, ...]:
     return tuple(int(p) for p in match.group(1).split(".") if p) if match else ()
 
 
+def osxcross_supported(root: Path) -> list[str]:
+    """SDK version patterns osxcross's build.sh accepts (its `case $SDK_VERSION` table)."""
+    with contextlib.suppress(OSError):
+        text = (root / "build.sh").read_text()
+        return [alt for line in re.findall(r"^\s*([\d.*|]+)\)\s*TARGET=", text, re.M) for alt in line.split("|")]
+    return []
+
+
+def pick_sdk(root: Path, names: list[str]) -> str:
+    """Newest SDK archive this osxcross can build. Xcode packs the same SDK under several names
+    (MacOSX27.2 and MacOSX27), and osxcross often lists only the shorter one."""
+    import fnmatch
+    patterns = osxcross_supported(root)
+    ordered = sorted(names, key=_sdk_version, reverse=True)
+    if not patterns:
+        return ordered[0]
+    for name in ordered:
+        version = ".".join(map(str, _sdk_version(name)))
+        if version and any(fnmatch.fnmatchcase(version, pat) for pat in patterns):
+            return name
+    newest = max(patterns, key=lambda p: tuple(int(x) for x in re.findall(r"\d+", p)))
+    raise BuildError(f"This osxcross does not support {', '.join(ordered)} yet (newest it knows: macOS "
+                     f"{newest.rstrip('*').rstrip('.')}). Use an older Xcode, or update osxcross and retry.")
+
+
 def install_osxcross(sdk: str | None) -> Path:
     heading("osxcross (macOS)")
     root = TOOLCHAIN_DIR / "osxcross"
@@ -2935,7 +2960,9 @@ def install_osxcross(sdk: str | None) -> Path:
     elif sdk_path:
         shutil.copy2(sdk_path, tarballs / sdk_path.name)
 
-    newest = max((p.name for p in tarballs.glob("MacOSX*.sdk.tar.*")), key=_sdk_version)
+    if (root / ".git").is_dir():  # newer osxcross knows newer SDKs
+        subprocess.run(["git", "-C", str(root), "pull", "--ff-only", "-q"], capture_output=True)
+    newest = pick_sdk(root, [p.name for p in tarballs.glob("MacOSX*.sdk.tar.*")])
     version = ".".join(map(str, _sdk_version(newest)))
     if version:
         env["SDK_VERSION"] = version
@@ -2944,8 +2971,8 @@ def install_osxcross(sdk: str | None) -> Path:
     if not run_logged(["./build.sh"], cwd=root, env=env, log_path=new_log_path("osxcross_build"),
                       title=f"Building osxcross (macOS SDK {version or '?'})", state_key="osxcross_build",
                       ctx=_plain_ctx(), task_id="osxcross:build"):
-        raise BuildError("osxcross failed to build. Missing development headers are the usual cause"
-                         + (f": {osxcross_packages()}" if osxcross_packages() else "."))
+        raise BuildError("osxcross failed to build (see the log). Missing development headers are a common "
+                         "cause" + (f": {osxcross_packages()}" if osxcross_packages() else "."))
     if not list((root / "target" / "bin").glob("x86_64-apple-darwin*-clang")):
         raise BuildError("osxcross built but no x86_64-apple-darwin clang wrapper was found in target/bin.")
     (root / ".gbm-version").write_text(f"SDK {version}\n")

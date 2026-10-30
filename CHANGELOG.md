@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.2
+
+- **osxcross with newer Xcode versions:** an Xcode `.xip` contains the same SDK under several names (for example
+  `MacOSX27.2` and `MacOSX27`). The installer now builds with the newest one that osxcross's `build.sh` supports,
+  instead of failing with "Unsupported SDK".
+- If no extracted SDK is supported, the installer says which macOS version osxcross supports up to.
+- osxcross is updated (`git pull`) before each build, so newer SDKs work as soon as osxcross supports them.
+
 ## 1.2.1
 
 - When some template builds fail (with **Keep going** on), the templates that did build are still installed, so
