@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- When some template builds fail (with **Keep going** on), the templates that did build are still installed, so
+  they can be used straight away. Failed targets keep their previously installed files, and the `.tpz` package is
+  still skipped.
+
 ## 1.2.0
 
 - **Toolchain installer** (Diagnostics → Cross-Compile Toolchains, `godot-build toolchain`):

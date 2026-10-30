@@ -50,9 +50,13 @@ except (ValueError, ImportError):
 APP_ID = "io.github.t1nkieplayz.GodotBuildManager"
 REPO_URL = "https://github.com/T1nkiePlayz/godot-build-manager"
 APP_NAME = "Godot Build Manager"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 BACKEND = Path(__file__).resolve().with_name("godot_build.py")
 RELEASE_NOTES = """
+<p>New in 1.2.1:</p>
+<ul>
+  <li>When some template builds fail, the ones that succeeded are still installed into the editor</li>
+</ul>
 <p>New in 1.2.0:</p>
 <ul>
   <li>Cross-compile toolchains installer on the Diagnostics page: llvm-mingw for Windows, osxcross and MoltenVK for macOS</li>
@@ -1168,7 +1172,7 @@ class TemplatesPage(Page):
         self.sw_mono = Adw.SwitchRow(title=".NET (C#) templates",
                                      subtitle="Defaults to the _DOTNET setting in custom.py")
         self.sw_install = Adw.SwitchRow(title="Install into the editor",
-                                        subtitle="Copies templates to ~/.local/share/godot/export_templates",
+                                        subtitle="After building, copies them to ~/.local/share/godot/export_templates",
                                         active=saved.get("install", True))
         self.sw_tpz = Adw.SwitchRow(title="Package .tpz archive", subtitle="Installable from Godot's template manager",
                                     active=saved.get("tpz", False))

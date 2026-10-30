@@ -839,6 +839,7 @@ def copy_executable(src: Path, dst: Path) -> None:
     shutil.copy2(src, tmp)
     tmp.chmod(0o755)
     tmp.replace(dst)
+    os.utime(dst)  # staged-at time: a partial install picks only this run's files
 
 
 def stage_job(ctx: Context, job: Job) -> None:
@@ -961,18 +962,20 @@ def package_tpz(ctx: Context, mono: bool) -> Path:
     return out
 
 
-def install_templates(ctx: Context, mono: bool) -> Path | None:
+def install_templates(ctx: Context, mono: bool, since: float | None = None) -> Path | None:
+    """Copy staged templates into Godot's template folder (only files newer than `since` when given)."""
     stage = staging_dir(ctx, mono)
     files = [p for p in stage.glob("*") if p.is_file()] if stage.is_dir() else []
+    if since is not None:
+        files = [p for p in files if p.stat().st_mtime >= since]
     if not files:
         skip(f"nothing staged for {ctx.version.template_dir_name(mono)}")
         return None
     write_version_file(ctx, mono)
     dest = USER_TEMPLATES_DIR / ctx.version.template_dir_name(mono)
     dest.mkdir(parents=True, exist_ok=True)
-    for path in sorted(stage.iterdir()):
-        if path.is_file():
-            shutil.copy2(path, dest / path.name)
+    for path in sorted(files):
+        shutil.copy2(path, dest / path.name)
     return dest
 
 
@@ -1247,6 +1250,7 @@ def build_templates(ctx: Context, args: argparse.Namespace) -> int:
 
     heading("Build")
     started = time.monotonic()
+    wall_started = time.time()
     key = read_key() if any(j.encrypt for j in jobs) else None
     interrupted = False
     for job in jobs:
@@ -1311,6 +1315,17 @@ def build_templates(ctx: Context, args: argparse.Namespace) -> int:
                 ok(f"installed  {S.dim('→')} {dest}")
         if args.tpz:
             ok(f"packaged   {S.dim('→')} {package_tpz(ctx, mono)}")
+    elif args.install and any(j.status == "ok" for j in jobs) and not interrupted:
+        # Install what did build so it is usable now; failed targets keep their previously installed files.
+        heading("Install")
+        dest = install_templates(ctx, mono, since=wall_started)
+        if dest:
+            ok(f"installed the templates that built  {S.dim('→')} {dest}")
+        failed = ", ".join(f"{j.platform.label} {j.kind}" + (f" {j.arch}" if j.arch else "")
+                           for j in jobs if j.status != "ok")
+        warn(f"Not installed (did not build): {failed}")
+        if args.tpz:
+            warn("Skipping the .tpz package because not every build succeeded.")
     elif args.install or args.tpz:
         warn("Skipping install/package because not every build succeeded.")
 
